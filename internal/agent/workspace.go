@@ -1,0 +1,345 @@
+package agent
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/laurenwilcox/name/internal/codeindex"
+	"github.com/laurenwilcox/name/internal/skills"
+)
+
+const (
+	maxReadBytes  = 200 << 10
+	maxListed     = 500
+	skeletonLimit = 30000
+)
+
+// Каталоги, которые агенту не нужны или которые нельзя трогать.
+var skipDirs = map[string]bool{".git": true, ".edy": true, "node_modules": true, "vendor": true, "__pycache__": true, ".venv": true, "venv": true}
+
+// Workspace — папка проекта. Агент видит и меняет только её содержимое,
+// без .git и служебной папки .edy.
+type Workspace struct {
+	Root string
+	// Skills — скиллы, доступные агенту через use_skill.
+	Skills []skills.Skill
+	// Memory — память проекта (project_memory, remember); nil — без памяти.
+	Memory Memory
+	// Code — поиск кода по смыслу в дополнение к поиску по словам; nil — только по словам.
+	Code CodeSearch
+}
+
+// CodeSearch — поиск кода (например, гибридный: слова и смысл). note —
+// пояснение для модели, если что-то пошло не так (пусто — всё хорошо).
+type CodeSearch interface {
+	Search(idx *codeindex.Index, query string, k int) (hits []codeindex.Hit, note string)
+}
+
+// Memory — память проекта для агента.
+type Memory interface {
+	Search(query string) string
+	Remember(text string) error
+}
+
+// resolve превращает путь от агента в абсолютный и не даёт выйти за пределы проекта.
+func (w Workspace) resolve(rel string) (string, error) {
+	if rel == "" {
+		rel = "."
+	}
+	if filepath.IsAbs(rel) {
+		return "", fmt.Errorf("путь %q должен быть относительным (от корня проекта)", rel)
+	}
+	clean := filepath.Clean(rel)
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("путь %q выходит за пределы проекта", rel)
+	}
+	first := strings.SplitN(clean, string(filepath.Separator), 2)[0]
+	if first == ".git" || first == ".edy" {
+		return "", fmt.Errorf("папка %s служебная, её трогать нельзя", first)
+	}
+	root, err := filepath.EvalSymlinks(w.Root)
+	if err != nil {
+		return "", err
+	}
+	abs := filepath.Join(root, clean)
+	// Символические ссылки не должны уводить за пределы проекта.
+	dir := abs
+	for {
+		if real, err := filepath.EvalSymlinks(dir); err == nil {
+			if real != root && !strings.HasPrefix(real, root+string(filepath.Separator)) {
+				return "", fmt.Errorf("путь %q ведёт за пределы проекта", rel)
+			}
+			break
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return abs, nil
+}
+
+// Tools — описания инструментов агента.
+func (w Workspace) Tools() []ToolDef {
+	def := func(name, desc, params string) ToolDef {
+		var t ToolDef
+		t.Type = "function"
+		t.Function.Name = name
+		t.Function.Description = desc
+		t.Function.Parameters = json.RawMessage(params)
+		return t
+	}
+	path := `{"type":"object","properties":{"path":{"type":"string","description":"путь от корня проекта"}},"required":["path"]}`
+	tools := []ToolDef{
+		def("project_skeleton", "Скелет проекта: файлы, типы, функции и классы с номерами строк, без тел. Начинайте с него.", `{"type":"object","properties":{}}`),
+		def("search_code", "Найти код по словам или по смыслу («где проверяется пароль»). Возвращает подходящие функции и классы с номерами строк.", `{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer","description":"сколько результатов, по умолчанию 5"}},"required":["query"]}`),
+		def("list_files", "Список файлов проекта (рекурсивно) в папке path.", `{"type":"object","properties":{"path":{"type":"string","description":"папка от корня проекта, по умолчанию корень"}}}`),
+		def("read_file", "Прочитать файл целиком.", path),
+		def("write_file", "Создать файл или полностью перезаписать его.", `{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}`),
+		def("replace_in_file", "Заменить в файле фрагмент old на new. old должен встречаться в файле ровно один раз.", `{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},"required":["path","old","new"]}`),
+		def("delete_file", "Удалить файл.", path),
+		def("finish", "Работа закончена. После этого Edy запустит линтеры и тесты.", `{"type":"object","properties":{"summary":{"type":"string","description":"что сделано, 1-3 предложения"}},"required":["summary"]}`),
+	}
+	if w.Memory != nil {
+		tools = append(tools,
+			def("project_memory", "Поиск в памяти проекта: факты (как собрать и запустить тесты), уроки прошлых задач, итоги. Ищите, прежде чем гадать.", `{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`),
+			def("remember", "Записать в память проекта короткий полезный факт для следующих задач (до 400 символов): как запускать, что хрупко, неочевидные договорённости. Не записывайте итог задачи — Edy сделает это сам.", `{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}`))
+	}
+	if len(w.Skills) > 0 {
+		tools = append(tools, def("use_skill", "Загрузить скилл — инструкцию проекта по имени из списка скиллов.", `{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}`))
+	}
+	return tools
+}
+
+// Call выполняет инструмент. changed — менялись ли файлы (нужен снимок).
+func (w Workspace) Call(name, args string) (result string, changed bool, err error) {
+	var a struct {
+		Path    string `json:"path"`
+		Content string `json:"content"`
+		Old     string `json:"old"`
+		New     string `json:"new"`
+		Query   string `json:"query"`
+		Name    string `json:"name"`
+		Text    string `json:"text"`
+		Limit   int    `json:"limit"`
+	}
+	if args != "" && json.Unmarshal([]byte(args), &a) != nil {
+		return "", false, fmt.Errorf("аргументы инструмента %s — не JSON", name)
+	}
+	switch name {
+	case "project_skeleton", "search_code":
+		idx, err := codeindex.Build(context.Background(), w.Root)
+		if err != nil {
+			return "", false, err
+		}
+		if name == "project_skeleton" {
+			return idx.Skeleton(skeletonLimit), false, nil
+		}
+		if strings.TrimSpace(a.Query) == "" {
+			return "", false, errors.New("query не может быть пустым")
+		}
+		if a.Limit <= 0 || a.Limit > 20 {
+			a.Limit = 5
+		}
+		if w.Code == nil {
+			return codeindex.FormatHits(idx.Search(a.Query, a.Limit), 80), false, nil
+		}
+		hits, note := w.Code.Search(idx, a.Query, a.Limit)
+		out := codeindex.FormatHits(hits, 80)
+		if note != "" {
+			out = "(" + note + ")\n" + out
+		}
+		return out, false, nil
+	case "project_memory", "remember":
+		if w.Memory == nil {
+			return "", false, errors.New("память проекта недоступна")
+		}
+		if name == "project_memory" {
+			return w.Memory.Search(a.Query), false, nil
+		}
+		if err := w.Memory.Remember(a.Text); err != nil {
+			return "", false, err
+		}
+		return "записано в память проекта", false, nil
+	case "use_skill":
+		sk, ok := skills.Find(w.Skills, a.Name)
+		if !ok {
+			return "", false, fmt.Errorf("скилл %q не найден", a.Name)
+		}
+		return "# Скилл " + sk.Name + "\n\n" + sk.Body, false, nil
+	case "list_files":
+		r, err := w.list(a.Path)
+		return r, false, err
+	case "read_file":
+		p, err := w.resolve(a.Path)
+		if err != nil {
+			return "", false, err
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return "", false, fmt.Errorf("не удалось прочитать %s: %w", a.Path, unwrapPath(err))
+		}
+		if len(data) > maxReadBytes {
+			return string(data[:maxReadBytes]) + "\n…(файл обрезан)", false, nil
+		}
+		return string(data), false, nil
+	case "write_file":
+		p, err := w.resolve(a.Path)
+		if err != nil {
+			return "", false, err
+		}
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			return "", false, err
+		}
+		if err := os.WriteFile(p, []byte(a.Content), 0o644); err != nil {
+			return "", false, err
+		}
+		return fmt.Sprintf("записано %s (%d байт)", a.Path, len(a.Content)), true, nil
+	case "replace_in_file":
+		p, err := w.resolve(a.Path)
+		if err != nil {
+			return "", false, err
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return "", false, fmt.Errorf("не удалось прочитать %s: %w", a.Path, unwrapPath(err))
+		}
+		switch n := strings.Count(string(data), a.Old); {
+		case a.Old == "":
+			return "", false, errors.New("old не может быть пустым")
+		case n == 0:
+			return "", false, fmt.Errorf("фрагмент old не найден в %s", a.Path)
+		case n > 1:
+			return "", false, fmt.Errorf("фрагмент old встречается в %s %d раз — уточните его", a.Path, n)
+		}
+		if err := os.WriteFile(p, []byte(strings.Replace(string(data), a.Old, a.New, 1)), 0o644); err != nil {
+			return "", false, err
+		}
+		return "заменено в " + a.Path, true, nil
+	case "delete_file":
+		p, err := w.resolve(a.Path)
+		if err != nil {
+			return "", false, err
+		}
+		if err := os.Remove(p); err != nil {
+			return "", false, fmt.Errorf("не удалось удалить %s: %w", a.Path, unwrapPath(err))
+		}
+		return "удалено " + a.Path, true, nil
+	}
+	return "", false, fmt.Errorf("неизвестный инструмент %q", name)
+}
+
+func (w Workspace) list(rel string) (string, error) {
+	start, err := w.resolve(rel)
+	if err != nil {
+		return "", err
+	}
+	root, _ := filepath.EvalSymlinks(w.Root)
+	var files []string
+	err = filepath.WalkDir(start, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if p != start && skipDirs[d.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		r, _ := filepath.Rel(root, p)
+		files = append(files, filepath.ToSlash(r))
+		if len(files) >= maxListed {
+			return fs.SkipAll
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	sort.Strings(files)
+	if len(files) == 0 {
+		return "(файлов нет)", nil
+	}
+	out := strings.Join(files, "\n")
+	if len(files) >= maxListed {
+		out += "\n…(показаны первые " + fmt.Sprint(maxListed) + ")"
+	}
+	return out, nil
+}
+
+// unwrapPath убирает из ошибки абсолютный путь — агенту он не нужен.
+func unwrapPath(err error) error {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		return pe.Err
+	}
+	return err
+}
+
+// Files возвращает файлы проекта (без служебных папок), не больше limit.
+func (w Workspace) Files(limit int) ([]string, error) {
+	root, err := filepath.EvalSymlinks(w.Root)
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	err = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if p != root && skipDirs[d.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		r, _ := filepath.Rel(root, p)
+		files = append(files, filepath.ToSlash(r))
+		if len(files) >= limit {
+			return fs.SkipAll
+		}
+		return nil
+	})
+	sort.Strings(files)
+	return files, err
+}
+
+// ReadText читает файл проекта для просмотра: не больше limit байт, без
+// двоичных файлов.
+func (w Workspace) ReadText(rel string, limit int) (text string, truncated bool, err error) {
+	p, err := w.resolve(rel)
+	if err != nil {
+		return "", false, err
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		return "", false, unwrapPath(err)
+	}
+	defer f.Close()
+	buf := make([]byte, limit+1)
+	n, _ := io.ReadFull(f, buf)
+	buf = buf[:n]
+	if n > limit {
+		buf, truncated = buf[:limit], true
+	}
+	// Обрезка могла разрезать последний символ UTF-8 — его отбрасываем.
+	check := buf
+	for i := 0; i < 3 && len(check) > 0 && !utf8.Valid(check); i++ {
+		check = check[:len(check)-1]
+	}
+	if bytes.IndexByte(buf, 0) >= 0 || !utf8.Valid(check) {
+		return "", false, errors.New("двоичный файл — просмотр только для текста")
+	}
+	return string(check), truncated, nil
+}

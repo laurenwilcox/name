@@ -1,0 +1,82 @@
+#!/bin/bash
+# Собирает Edy.app — окно Edy на Wails — для этого Mac.
+# Нужны: Go 1.26+ (brew install go) и Xcode Command Line Tools (xcode-select --install).
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+if ! command -v go >/dev/null; then
+  echo "Не найден Go. Установите: brew install go" >&2
+  exit 1
+fi
+if ! xcode-select -p >/dev/null 2>&1; then
+  echo "Не найдены Xcode Command Line Tools. Установите: xcode-select --install" >&2
+  exit 1
+fi
+
+VERSION="$(git describe --tags --always 2>/dev/null || echo dev)"
+APP="build/Edy.app"
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/bin"
+
+echo "Собираю окно Edy ($VERSION)…"
+CGO_ENABLED=1 \
+CGO_LDFLAGS="-framework UniformTypeIdentifiers" \
+MACOSX_DEPLOYMENT_TARGET=13.0 \
+  go build -tags desktop,production -trimpath -ldflags "-s -w" -o "$APP/Contents/MacOS/Edy" ./cmd/edy-app
+
+# Команда edy лежит отдельно от окна: файловая система Mac не различает регистр,
+# и «edy» рядом с «Edy» перезаписал бы само приложение.
+echo "Собираю команду edy…"
+CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$APP/Contents/Resources/bin/edy" ./cmd/edy
+
+# Проверка: в MacOS/Edy должно лежать окно, а не копия команды edy.
+if cmp -s "$APP/Contents/MacOS/Edy" "$APP/Contents/Resources/bin/edy"; then
+  echo "Ошибка сборки: вместо окна в бандле оказалась команда edy" >&2
+  exit 1
+fi
+
+# Иконка приложения из логотипа: набор размеров → edy.icns.
+ICONSET="$(mktemp -d)/edy.iconset"
+mkdir -p "$ICONSET"
+for sz in 16 32 128 256 512; do
+  sips -z $sz $sz assets/logo.png --out "$ICONSET/icon_${sz}x${sz}.png" >/dev/null
+  sips -z $((sz*2)) $((sz*2)) assets/logo.png --out "$ICONSET/icon_${sz}x${sz}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/edy.icns"
+rm -rf "$(dirname "$ICONSET")"
+
+cat > "$APP/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>Edy</string>
+  <key>CFBundleDisplayName</key><string>Edy</string>
+  <key>CFBundleIdentifier</key><string>dev.edy.ide</string>
+  <key>CFBundleExecutable</key><string>Edy</string>
+  <key>CFBundleIconFile</key><string>edy</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+  <key>CFBundleVersion</key><string>${VERSION}</string>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>Edy записывает голосовые сообщения и диктовку для чата с моделями.</string>
+  <key>NSSpeechRecognitionUsageDescription</key><string>Edy превращает речь в текст в поле ввода.</string>
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <!-- Окно открывает интерфейс Edy с http://127.0.0.1 -->
+    <key>NSAllowsLocalNetworking</key><true/>
+  </dict>
+</dict>
+</plist>
+PLIST
+
+# Подпись «для себя», чтобы macOS запускала приложение без лишних вопросов.
+codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || true
+
+echo
+echo "Готово: $APP"
+echo "Запуск:      open $APP"
+echo "Установить:  rm -rf /Applications/Edy.app && cp -R $APP /Applications/"
+echo "Команда edy: $APP/Contents/Resources/bin/edy"
